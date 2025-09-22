@@ -55,13 +55,31 @@ async def download_version_manifest_v2(dl: Downloader, version_manifest_v2_path)
     url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
     await dl.download(url, version_manifest_v2_path)
 
-async def get_version_list(version_manifest_v2_path, selected_version):
+
+async def get_version_dict_list(version_manifest_v2_path):
     async with aiofiles.open(version_manifest_v2_path, mode="r") as f:
         version_manifest_v2_str = await f.read()
         version_manifest_v2_dict = json.loads(version_manifest_v2_str)
         version_manifest_v2_latest_versions = version_manifest_v2_dict["latest"]
         version_manifest_v2_versions = version_manifest_v2_dict["versions"]
         return version_manifest_v2_latest_versions, version_manifest_v2_versions
+
+
+async def get_version_list(version_dict_list):
+    version_list = []
+    for version in version_dict_list:
+        version_list.append(version["id"])
+    return version_list
+
+
+async def get_selected_version(version_list, version_dict_list):
+    selected_version_str = input("请输入目标版本" + str(version_list))
+    if selected_version_str in version_list:
+        for version in version_dict_list:
+            if version["id"] == selected_version_str:
+                return version
+    raise ValueError(f"输入的版本号无效：{selected_version_str}")
+
 
 async def main():
     async with aiohttp.ClientSession() as session:
@@ -72,7 +90,11 @@ async def main():
         dl = Downloader(session=session)
 
         await download_version_manifest_v2(dl, version_manifest_v2_path)
-        await get_version_list(version_manifest_v2_path, "1.21.8")
+        latest_version_dict, version_dict_list = await get_version_dict_list(version_manifest_v2_path)
+        version_list = await get_version_list(version_dict_list)
+        selected_version = await get_selected_version(version_list, version_dict_list)
+        print(selected_version)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
