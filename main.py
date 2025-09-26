@@ -18,16 +18,34 @@ class Downloader:
     async def download(self, url: str, path: str, sha1: str = "") -> str | None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
+        if sha1 and Path(path).exists():
+            h = hashlib.sha1()
+            async with aiofiles.open(path, "rb") as f:
+                while True:
+                    chunk = await f.read(self.chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            digest = h.hexdigest()
+            if digest == sha1:
+                print(f"文件已存在且校验通过，跳过下载：{path}")
+                return path
+            else:
+                print(f"文件已存在但校验失败，将重新下载：{path}\n期望：{sha1}\n实际：{digest}")
+                Path(path).unlink(missing_ok=True)
+
         for attempt in range(1, self.retries + 1):
             try:
                 h = hashlib.sha1() if sha1 else None
                 async with self.session.get(url=url, timeout=self.timeout) as resp:
                     if resp.status != 200:
+                        if resp.status == 429:
+                            raise ValueError(f"请求频率过高")
                         raise ValueError(f"服务器返回状态码 {resp.status}")
 
-                    with open(path, "wb") as f:
+                    async with aiofiles.open(path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(self.chunk_size):
-                            f.write(chunk)
+                            await f.write(chunk)
                             if h:
                                 h.update(chunk)
 
@@ -38,8 +56,6 @@ class Downloader:
                         raise ValueError(
                             f"SHA1 校验失败：{path}\n期望：{sha1}\n实际：{digest}"
                         )
-
-                print(f"下载完成：{path}")
                 return path
 
             except Exception as e:
@@ -86,8 +102,30 @@ async def get_selected_version(version_list, version_dict_list):
                 return version
     raise ValueError(f"输入的版本号无效：{selected_version_str}")
 
-async def download_assets_of_selected_version(selected_version_json, minecraft_folder):
+
+async def download_assets_of_selected_version(dl: Downloader, selected_version_json, minecraft_folder):
+    asset_root_url = "https://resources.download.minecraft.net"
     assets_folder = os.path.join(minecraft_folder, "assets")
+    asset_index_dict = selected_version_json["assetIndex"]
+    asset_index_id = asset_index_dict["id"]
+    asset_index_sha1 = asset_index_dict["sha1"]
+    asset_index_url = asset_index_dict["url"]
+    asset_index_path = os.path.join(assets_folder, "indexes", f"{asset_index_id}.json")
+    asset_objects_folder = os.path.join(assets_folder, "objects")
+    await dl.download(asset_index_url, asset_index_path, asset_index_sha1)
+    async with aiofiles.open(asset_index_path, "r") as f:
+        asset_index = json.loads(await f.read())
+        asset_index_objects = asset_index["objects"]
+
+        tasks = []
+
+        for asset_index_object_path in asset_index_objects:
+            asset_index_object_hash = asset_index_objects[asset_index_object_path]["hash"]
+            asset_index_object_url = f"{asset_root_url}/{asset_index_object_hash[:2]}/{asset_index_object_hash}"
+            asset_index_object_path = os.path.join(asset_objects_folder,
+                                                   asset_index_object_hash[:2], asset_index_object_hash)
+            tasks.append(dl.download(asset_index_object_url, asset_index_object_path, asset_index_object_hash))
+        await asyncio.gather(*tasks)
 
 async def download_selected_version(dl: Downloader, selected_version, minecraft_folder, version_isolation=False):
     minecraft_versions_path = os.path.join(minecraft_folder, "versions")
@@ -99,8 +137,8 @@ async def download_selected_version(dl: Downloader, selected_version, minecraft_
     selected_version_json_sha1 = selected_version["sha1"]
     await dl.download(selected_version_json_url, selected_version_json_path, selected_version_json_sha1)
     async with aiofiles.open(selected_version_json_path, mode="r") as f:
-        selected_version_json = await f.read()
-
+        selected_version_json = json.loads(await f.read())
+        await download_assets_of_selected_version(dl, selected_version_json, minecraft_folder)
 
 
 async def main():
