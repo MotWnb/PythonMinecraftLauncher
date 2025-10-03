@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
+import re
 from pathlib import Path
 
 import aiofiles
@@ -9,7 +11,7 @@ import aiohttp
 
 
 class Downloader:
-    def __init__(self, retries=3, chunk_size=8192, timeout=30, session=None):
+    def __init__(self, retries=5, chunk_size=32768, timeout=30, session=None):
         self.retries = retries
         self.chunk_size = chunk_size
         self.timeout = timeout
@@ -131,6 +133,60 @@ async def download_assets_of_selected_version(dl: Downloader, selected_version_j
         await asyncio.gather(*tasks)
 
 
+async def download_selected_version_client_jar(dl: Downloader, selected_version_json, selected_version_folder,
+                                               selected_version_id):
+    selected_version_client_jar_dict = selected_version_json["downloads"]["client"]
+    selected_version_client_jar_url = selected_version_client_jar_dict["url"]
+    selected_version_client_jar_path = os.path.join(selected_version_folder, f"{selected_version_id}.jar")
+    selected_version_client_jar_sha1 = selected_version_client_jar_dict["sha1"]
+    await dl.download(selected_version_client_jar_url, selected_version_client_jar_path,
+                      selected_version_client_jar_sha1)
+
+
+def is_allowed(rules):
+    action = False
+    for rule in rules:
+        if "os" in rule:
+            os_rule = rule["os"]
+            if "name" in os_rule:
+                if name != os_rule["name"]:
+                    continue
+            if "arch" in os_rule:
+                if arch != os_rule["arch"]:
+                    continue
+            if "version" in os_rule:
+                version_pattern = re.compile(os_rule["version"])
+                if not version_pattern.match(os_version):
+                    continue
+        if rule["action"] == "allow":
+            action = True
+        if rule["action"] == "disallow":
+            action = False
+    return action
+
+
+async def download_library(dl: Downloader, library_dict, selected_version_folder, selected_version_id, libraries_folder):
+    if "rules" in library_dict:
+        rules = library_dict["rules"]
+        if not is_allowed(rules):
+            return
+    artifact_dict = library_dict["downloads"]["artifact"]
+    artifact_url = artifact_dict["url"]
+    artifact_path = str(os.path.join(libraries_folder, artifact_dict["path"]))
+    artifact_sha1 = artifact_dict["sha1"]
+    await dl.download(artifact_url, artifact_path, artifact_sha1)
+
+
+async def download_selected_version_libraries(dl: Downloader, selected_version_json, minecraft_folder,
+                                              selected_version_folder, selected_version_id):
+    libraries_folder = os.path.join(minecraft_folder, "libraries")
+    selected_version_libraries_list = selected_version_json["libraries"]
+    tasks = []
+    for library in selected_version_libraries_list:
+        tasks.append(download_library(dl, library, selected_version_folder, selected_version_id, libraries_folder))
+    await asyncio.gather(*tasks)
+
+
 async def download_selected_version(dl: Downloader, selected_version, minecraft_folder, version_isolation=False):
     minecraft_versions_path = os.path.join(minecraft_folder, "versions")
     selected_version_id = selected_version["id"]
@@ -142,7 +198,13 @@ async def download_selected_version(dl: Downloader, selected_version, minecraft_
     await dl.download(selected_version_json_url, selected_version_json_path, selected_version_json_sha1)
     async with aiofiles.open(selected_version_json_path, mode="r") as f:
         selected_version_json = json.loads(await f.read())
-        await download_assets_of_selected_version(dl, selected_version_json, minecraft_folder)
+        tasks = [download_assets_of_selected_version(dl, selected_version_json, minecraft_folder),
+                 download_selected_version_client_jar(dl, selected_version_json, selected_version_folder,
+                                                      selected_version_id),
+                 download_selected_version_libraries(dl, selected_version_json, minecraft_folder,
+                                                     selected_version_folder, selected_version_id)
+                 ]
+        await asyncio.gather(*tasks)
 
 
 async def main():
@@ -163,5 +225,43 @@ async def main():
         await download_selected_version(dl, selected_version, minecraft_folder, version_isolation)
 
 
+def get_architecture():
+    arch_ = platform.machine().lower()  # 统一转为小写，避免大小写问题
+    if arch_ in ['x86_64', 'amd64']:
+        return 'x64'
+    elif arch_ in ['i386', 'i686', 'x86']:
+        return 'x86'
+    elif arch_ in ['aarch64', 'arm64']:
+        return 'arm64'
+    else:
+        return f"未知架构: {arch_}"
+
+
+def get_os():
+    os_name = platform.system()
+    if os_name == 'Windows':
+        return 'windows'
+    elif os_name == 'linux':
+        return 'Linux'
+    elif os_name == 'Darwin':
+        return 'osx'
+    else:
+        return f"未知操作系统: {os_name}"
+
+
+def get_os_version():
+    if name == "windows":
+        return platform.release() + "." + platform.version().split('.')[2]
+    elif name == "osx":
+        return platform.mac_ver()[0]
+    elif name == "linux":
+        return platform.release()
+    else:
+        return ""  # 未知系统返回空
+
+
 if __name__ == "__main__":
+    name = get_os()
+    arch = get_architecture()
+    os_version = get_os_version()
     asyncio.run(main())
