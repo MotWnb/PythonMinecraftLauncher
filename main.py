@@ -4,8 +4,8 @@ import json
 import os
 from pathlib import Path
 
-import aiohttp
 import aiofiles
+import aiohttp
 
 
 class Downloader:
@@ -53,17 +53,15 @@ class Downloader:
                     digest = h.hexdigest()
                     if digest != sha1:
                         Path(path).unlink(missing_ok=True)
-                        raise ValueError(
-                            f"SHA1 校验失败：{path}\n期望：{sha1}\n实际：{digest}"
-                        )
+                        raise ValueError(f"SHA1 校验失败：{path}\n期望：{sha1}\n实际：{digest}")
                 return path
 
             except Exception as e:
-                print(f"【第 {attempt}/{self.retries} 次尝试】下载失败：{url}\n原因：{e}")
+                print(f"【第 {attempt}/{self.retries} 次尝试】下载失败：{url}\n原因：{str(e)}")
                 if attempt == self.retries:
                     print(f"下载最终失败：{url}")
                     raise
-                await asyncio.sleep(1)  # 简单退避，避免持续请求服务器
+                await asyncio.sleep(1)
         return None
 
 
@@ -117,15 +115,21 @@ async def download_assets_of_selected_version(dl: Downloader, selected_version_j
         asset_index = json.loads(await f.read())
         asset_index_objects = asset_index["objects"]
 
-        tasks = []
+        semaphore = asyncio.Semaphore(256)
 
+        async def bounded_download(url, path, sha1):
+            async with semaphore:
+                return await dl.download(url, path, sha1)
+
+        tasks = []
         for asset_index_object_path in asset_index_objects:
             asset_index_object_hash = asset_index_objects[asset_index_object_path]["hash"]
             asset_index_object_url = f"{asset_root_url}/{asset_index_object_hash[:2]}/{asset_index_object_hash}"
-            asset_index_object_path = os.path.join(asset_objects_folder,
-                                                   asset_index_object_hash[:2], asset_index_object_hash)
-            tasks.append(dl.download(asset_index_object_url, asset_index_object_path, asset_index_object_hash))
+            asset_index_object_path = os.path.join(asset_objects_folder, asset_index_object_hash[:2],
+                                                   asset_index_object_hash)
+            tasks.append(bounded_download(asset_index_object_url, asset_index_object_path, asset_index_object_hash))
         await asyncio.gather(*tasks)
+
 
 async def download_selected_version(dl: Downloader, selected_version, minecraft_folder, version_isolation=False):
     minecraft_versions_path = os.path.join(minecraft_folder, "versions")
@@ -150,8 +154,9 @@ async def main():
         version_manifest_v2_path = os.path.join(pml_folder, "version_manifest_v2.json")
 
         dl = Downloader(session=session)
-
+        print("开始下载版本清单文件")
         await download_version_manifest_v2(dl, version_manifest_v2_path)
+        print("开始统计版本")
         latest_version_dict, version_dict_list = await get_version_dict_list(version_manifest_v2_path)
         snapshot_version_list, release_version_list, version_list = await get_version_list(version_dict_list)
         selected_version = await get_selected_version(release_version_list, version_dict_list)
