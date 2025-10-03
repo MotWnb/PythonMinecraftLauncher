@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import zipfile
 from pathlib import Path
 
 import aiofiles
@@ -165,16 +166,50 @@ def is_allowed(rules):
     return action
 
 
-async def download_library(dl: Downloader, library_dict, selected_version_folder, selected_version_id, libraries_folder):
+async def download_library(dl: Downloader, library_dict, selected_version_folder, selected_version_id,
+                           libraries_folder):
     if "rules" in library_dict:
         rules = library_dict["rules"]
         if not is_allowed(rules):
             return
-    artifact_dict = library_dict["downloads"]["artifact"]
+    if "classifiers" in library_dict["downloads"]:
+        artifact_dict = library_dict["downloads"]["classifiers"][library_dict["natives"][name]]
+    else:
+        artifact_dict = library_dict["downloads"]["artifact"]
     artifact_url = artifact_dict["url"]
     artifact_path = str(os.path.join(libraries_folder, artifact_dict["path"]))
     artifact_sha1 = artifact_dict["sha1"]
     await dl.download(artifact_url, artifact_path, artifact_sha1)
+    if "classifiers" in library_dict["downloads"]:
+        # 解压目标文件夹
+        natives_folder = os.path.join(selected_version_folder, f"{selected_version_id}-natives")
+        os.makedirs(natives_folder, exist_ok=True)
+
+        # 获取需要排除的路径前缀
+        exclude_prefixes = library_dict.get("extract", {}).get("exclude", [])
+
+        loop = asyncio.get_running_loop()
+
+        def unzip_sync():
+            with zipfile.ZipFile(artifact_path, "r") as zf:
+                for member in zf.namelist():
+                    # 排除 exclude
+                    if any(member.startswith(p) for p in exclude_prefixes):
+                        continue
+                    # 只提取文件，不保留目录结构
+                    if member.endswith("/"):
+                        continue
+                    data = zf.read(member)
+                    # 文件名去掉路径，只保留最后部分
+                    filename = os.path.basename(member)
+                    target_path = os.path.join(natives_folder, filename)
+                    print(f"正在解压{filename}从{artifact_path}")
+                    with open(target_path, "wb") as f:
+                        f.write(data)
+
+        # 放到线程池执行，避免阻塞事件循环
+        await loop.run_in_executor(None, unzip_sync) # noinspection PyTypeChecker
+        # 奇妙警告,爱来自PY-63820,不知道为何还无法抑制
 
 
 async def download_selected_version_libraries(dl: Downloader, selected_version_json, minecraft_folder,
@@ -187,7 +222,7 @@ async def download_selected_version_libraries(dl: Downloader, selected_version_j
     await asyncio.gather(*tasks)
 
 
-async def download_selected_version(dl: Downloader, selected_version, minecraft_folder, version_isolation=False):
+async def download_selected_version(dl: Downloader, selected_version, minecraft_folder):
     minecraft_versions_path = os.path.join(minecraft_folder, "versions")
     selected_version_id = selected_version["id"]
 
@@ -208,11 +243,11 @@ async def download_selected_version(dl: Downloader, selected_version, minecraft_
 
 
 async def main():
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(limit=512)
+    async with aiohttp.ClientSession(connector=connector) as session:
         cwd = os.getcwd()
         pml_folder = os.path.join(cwd, "PML")
         minecraft_folder = os.path.join(cwd, ".minecraft")
-        version_isolation = False
         version_manifest_v2_path = os.path.join(pml_folder, "version_manifest_v2.json")
 
         dl = Downloader(session=session)
@@ -222,7 +257,7 @@ async def main():
         latest_version_dict, version_dict_list = await get_version_dict_list(version_manifest_v2_path)
         snapshot_version_list, release_version_list, version_list = await get_version_list(version_dict_list)
         selected_version = await get_selected_version(release_version_list, version_dict_list)
-        await download_selected_version(dl, selected_version, minecraft_folder, version_isolation)
+        await download_selected_version(dl, selected_version, minecraft_folder)
 
 
 def get_architecture():
