@@ -1,10 +1,15 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import platform
+import queue
 import re
+import shutil
+import sys
 import zipfile
+from logging import handlers
 from pathlib import Path
 
 import aiofiles
@@ -31,10 +36,10 @@ class Downloader:
                     h.update(chunk)
             digest = h.hexdigest()
             if digest == sha1:
-                print(f"文件已存在且校验通过，跳过下载：{path}")
+                logging.debug(f"文件已存在且校验通过，跳过下载：{path}")
                 return path
             else:
-                print(f"文件已存在但校验失败，将重新下载：{path}\n期望：{sha1}\n实际：{digest}")
+                logging.warning(f"文件已存在但校验失败，将重新下载：{path}\n期望：{sha1}\n实际：{digest}")
                 Path(path).unlink(missing_ok=True)
 
         for attempt in range(1, self.retries + 1):
@@ -43,8 +48,10 @@ class Downloader:
                 async with self.session.get(url=url, timeout=self.timeout) as resp:
                     if resp.status != 200:
                         if resp.status == 429:
-                            raise ValueError(f"请求频率过高")
-                        raise ValueError(f"服务器返回状态码 {resp.status}")
+                            logging.warning(f"{url}:429 请求频率过高")
+                            raise ValueError()
+                        logging.warning(f"服务器返回状态码 {resp.status}")
+                        raise ValueError()
 
                     async with aiofiles.open(path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(self.chunk_size):
@@ -56,24 +63,25 @@ class Downloader:
                     digest = h.hexdigest()
                     if digest != sha1:
                         Path(path).unlink(missing_ok=True)
-                        raise ValueError(f"SHA1 校验失败：{path}\n期望：{sha1}\n实际：{digest}")
+                        logging.warning(f"SHA1 校验失败：{path}\n期望：{sha1}\n实际：{digest}")
+                        raise ValueError()
                 return path
 
             except Exception as e:
-                print(f"【第 {attempt}/{self.retries} 次尝试】下载失败：{url}\n原因：{str(e)}")
+                logging.warning(f"【第 {attempt}/{self.retries} 次尝试】下载失败：{url}\n原因：{str(e)}")
                 if attempt == self.retries:
-                    print(f"下载最终失败：{url}")
+                    logging.warning(f"下载最终失败：{url}")
                     raise
                 await asyncio.sleep(1)
         return None
 
 
-async def download_version_manifest_v2(dl: Downloader, version_manifest_v2_path):
+async def download_version_manifest_v2(dl: Downloader):
     url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
     await dl.download(url, version_manifest_v2_path)
 
 
-async def get_version_dict_list(version_manifest_v2_path):
+async def get_version_dict_list():
     async with aiofiles.open(version_manifest_v2_path, mode="r") as f:
         version_manifest_v2_str = await f.read()
         version_manifest_v2_dict = json.loads(version_manifest_v2_str)
@@ -101,10 +109,11 @@ async def get_selected_version(version_list, version_dict_list):
         for version in version_dict_list:
             if version["id"] == selected_version_str:
                 return version
-    raise ValueError(f"输入的版本号无效：{selected_version_str}")
+    logging.warning(f"输入的版本号无效：{selected_version_str}")
+    raise ValueError()
 
 
-async def download_assets_of_selected_version(dl: Downloader, selected_version_json, minecraft_folder):
+async def download_assets_of_selected_version(dl: Downloader, selected_version_json):
     asset_root_url = "https://resources.download.minecraft.net"
     assets_folder = os.path.join(minecraft_folder, "assets")
     asset_index_dict = selected_version_json["assetIndex"]
@@ -203,16 +212,16 @@ async def download_library(dl: Downloader, library_dict, selected_version_folder
                     # 文件名去掉路径，只保留最后部分
                     filename = os.path.basename(member)
                     target_path = os.path.join(natives_folder, filename)
-                    print(f"正在解压{filename}从{artifact_path}")
+                    logging.debug(f"正在解压{filename}从{artifact_path}")
                     with open(target_path, "wb") as f:
                         f.write(data)
 
         # 放到线程池执行，避免阻塞事件循环
-        await loop.run_in_executor(None, unzip_sync) # noinspection PyTypeChecker
+        await loop.run_in_executor(None, unzip_sync)  # noinspection PyTypeChecker
         # 奇妙警告,爱来自PY-63820,不知道为何还无法抑制
 
 
-async def download_selected_version_libraries(dl: Downloader, selected_version_json, minecraft_folder,
+async def download_selected_version_libraries(dl: Downloader, selected_version_json,
                                               selected_version_folder, selected_version_id):
     libraries_folder = os.path.join(minecraft_folder, "libraries")
     selected_version_libraries_list = selected_version_json["libraries"]
@@ -222,7 +231,7 @@ async def download_selected_version_libraries(dl: Downloader, selected_version_j
     await asyncio.gather(*tasks)
 
 
-async def download_selected_version(dl: Downloader, selected_version, minecraft_folder):
+async def download_selected_version(dl: Downloader, selected_version):
     minecraft_versions_path = os.path.join(minecraft_folder, "versions")
     selected_version_id = selected_version["id"]
 
@@ -233,31 +242,34 @@ async def download_selected_version(dl: Downloader, selected_version, minecraft_
     await dl.download(selected_version_json_url, selected_version_json_path, selected_version_json_sha1)
     async with aiofiles.open(selected_version_json_path, mode="r") as f:
         selected_version_json = json.loads(await f.read())
-        tasks = [download_assets_of_selected_version(dl, selected_version_json, minecraft_folder),
+        tasks = [download_assets_of_selected_version(dl, selected_version_json),
                  download_selected_version_client_jar(dl, selected_version_json, selected_version_folder,
                                                       selected_version_id),
-                 download_selected_version_libraries(dl, selected_version_json, minecraft_folder,
+                 download_selected_version_libraries(dl, selected_version_json,
                                                      selected_version_folder, selected_version_id)
                  ]
         await asyncio.gather(*tasks)
 
 
+async def download_main(session):
+    dl = Downloader(session=session)
+    logging.info("开始下载版本清单文件")
+    await download_version_manifest_v2(dl)
+    logging.info("开始统计版本")
+    latest_version_dict, version_dict_list = await get_version_dict_list()
+    snapshot_version_list, release_version_list, version_list = await get_version_list(version_dict_list)
+    selected_version = await get_selected_version(release_version_list, version_dict_list)
+    await download_selected_version(dl, selected_version)
+
+
+async def launch_main():
+    versions_folder = os.path.join(minecraft_folder, "versions")
+
+
 async def main():
     connector = aiohttp.TCPConnector(limit=512)
     async with aiohttp.ClientSession(connector=connector) as session:
-        cwd = os.getcwd()
-        pml_folder = os.path.join(cwd, "PML")
-        minecraft_folder = os.path.join(cwd, ".minecraft")
-        version_manifest_v2_path = os.path.join(pml_folder, "version_manifest_v2.json")
-
-        dl = Downloader(session=session)
-        print("开始下载版本清单文件")
-        await download_version_manifest_v2(dl, version_manifest_v2_path)
-        print("开始统计版本")
-        latest_version_dict, version_dict_list = await get_version_dict_list(version_manifest_v2_path)
-        snapshot_version_list, release_version_list, version_list = await get_version_list(version_dict_list)
-        selected_version = await get_selected_version(release_version_list, version_dict_list)
-        await download_selected_version(dl, selected_version, minecraft_folder)
+        await download_main(session)
 
 
 def get_architecture():
@@ -295,8 +307,60 @@ def get_os_version():
         return ""  # 未知系统返回空
 
 
+def rotate_logs(base_log_file: str, max_files: int = 5):
+    for i in range(max_files - 1, 0, -1):
+        src = f"{base_log_file}.{i}"
+        dst = f"{base_log_file}.{i + 1}"
+        if os.path.exists(src):
+            shutil.move(src, dst)
+    if os.path.exists(base_log_file):
+        shutil.move(base_log_file, f"{base_log_file}.1")
+
+class InfoFilter(logging.Filter):
+    def filter(self, record):
+        # 只允许 INFO 以上
+        return record.levelno >= logging.INFO
+
+def setup_async_logger(log_file: str):
+    rotate_logs(log_file, max_files=5)
+
+    log_queue = queue.Queue(-1)
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(queue_handler)
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s"
+    ))
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    console_handler.addFilter(InfoFilter())
+
+    queue_listener = logging.handlers.QueueListener(
+        log_queue, file_handler, console_handler
+    )
+    queue_listener.start()
+
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+    return queue_listener
+
+
 if __name__ == "__main__":
+    cwd = os.getcwd()
+    pml_folder = os.path.join(cwd, "PML")
+    minecraft_folder = os.path.join(cwd, ".minecraft")
     name = get_os()
     arch = get_architecture()
     os_version = get_os_version()
+    version_manifest_v2_path = os.path.join(pml_folder, "version_manifest_v2.json")
+
+    logfile_path = os.path.join(pml_folder, "log.log")
+    listener = setup_async_logger(logfile_path)
+
     asyncio.run(main())
