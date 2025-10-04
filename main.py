@@ -276,6 +276,9 @@ async def get_local_version_list():  # and dict(
     logging.debug("开始统计版本")
     subfolder_names = []
     subfolder_dict = {}
+    if not aiofiles.os.path.exists(versions_folder):
+        logging.warning(f"versions目录不存在:{versions_folder}")
+        raise Exception
     for item_name in await aiofiles.os.listdir(versions_folder):
         item_full_path = os.path.join(versions_folder, item_name)
         if os.path.isdir(item_full_path):  # 判断是否为目录
@@ -355,6 +358,7 @@ async def get_launch_arguments(selected_version_json):
 async def launch_selected_version(dl: Downloader, selected_version_json):
     await get_launch_arguments(selected_version_json)
 
+
 async def launch_main(dl: Downloader):
     local_version_list, local_version_dict = await get_local_version_list()
     selected_version_json = await get_local_selected_version(local_version_list, local_version_dict)
@@ -365,8 +369,8 @@ async def main():
     connector = aiohttp.TCPConnector(limit=512)
     async with aiohttp.ClientSession(connector=connector) as session:
         dl = Downloader(session=session)
-        await launch_main(dl)
-        # await download_main(dl)
+        # await launch_main(dl)
+        await download_main(dl)
 
 
 def get_architecture():
@@ -453,6 +457,7 @@ def setup_async_logger(log_file: str):
 if __name__ == "__main__":
     cwd = os.getcwd()
     pml_folder = os.path.join(cwd, "PML")
+    os.makedirs(pml_folder, exist_ok=True)
     minecraft_folder = os.path.join(cwd, ".minecraft")
     name = get_os()
     arch = get_architecture()
