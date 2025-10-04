@@ -13,6 +13,7 @@ from logging import handlers
 from pathlib import Path
 
 import aiofiles
+import aiofiles.os
 import aiohttp
 
 
@@ -77,6 +78,7 @@ class Downloader:
 
 
 async def download_version_manifest_v2(dl: Downloader):
+    logging.info("开始下载版本清单文件")
     url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
     await dl.download(url, version_manifest_v2_path)
 
@@ -90,7 +92,8 @@ async def get_version_dict_list():
         return version_manifest_v2_latest_versions, version_manifest_v2_versions
 
 
-async def get_version_list(version_dict_list):
+async def get_remote_version_list(version_dict_list):
+    logging.info("开始统计版本")
     release_version_list = []
     snapshot_version_list = []
     version_list = []
@@ -153,7 +156,7 @@ async def download_selected_version_client_jar(dl: Downloader, selected_version_
                       selected_version_client_jar_sha1)
 
 
-def is_allowed(rules):
+def is_allowed(rules, features: dict = None):
     action = False
     for rule in rules:
         if "os" in rule:
@@ -167,6 +170,17 @@ def is_allowed(rules):
             if "version" in os_rule:
                 version_pattern = re.compile(os_rule["version"])
                 if not version_pattern.match(os_version):
+                    continue
+            if "feature" in os_rule:
+                if features is not None:
+                    target_features: dict = os_rule["feature"]
+                    for target_feature in target_features:
+                        if target_feature in features:
+                            if features[target_feature] != target_features[target_feature]:
+                                continue
+                        else:
+                            continue
+                else:
                     continue
         if rule["action"] == "allow":
             action = True
@@ -232,10 +246,9 @@ async def download_selected_version_libraries(dl: Downloader, selected_version_j
 
 
 async def download_selected_version(dl: Downloader, selected_version):
-    minecraft_versions_path = os.path.join(minecraft_folder, "versions")
     selected_version_id = selected_version["id"]
 
-    selected_version_folder = os.path.join(minecraft_versions_path, selected_version_id)
+    selected_version_folder = os.path.join(versions_folder, selected_version_id)
     selected_version_json_path = os.path.join(selected_version_folder, f"{selected_version_id}.json")
     selected_version_json_url = selected_version["url"]
     selected_version_json_sha1 = selected_version["sha1"]
@@ -251,29 +264,113 @@ async def download_selected_version(dl: Downloader, selected_version):
         await asyncio.gather(*tasks)
 
 
-async def download_main(session):
-    dl = Downloader(session=session)
-    logging.info("开始下载版本清单文件")
+async def download_main(dl: Downloader):
     await download_version_manifest_v2(dl)
-    logging.info("开始统计版本")
     latest_version_dict, version_dict_list = await get_version_dict_list()
-    snapshot_version_list, release_version_list, version_list = await get_version_list(version_dict_list)
+    snapshot_version_list, release_version_list, version_list = await get_remote_version_list(version_dict_list)
     selected_version = await get_selected_version(release_version_list, version_dict_list)
     await download_selected_version(dl, selected_version)
 
 
-async def launch_main():
-    versions_folder = os.path.join(minecraft_folder, "versions")
+async def get_local_version_list():  # and dict(
+    logging.debug("开始统计版本")
+    subfolder_names = []
+    subfolder_dict = {}
+    for item_name in await aiofiles.os.listdir(versions_folder):
+        item_full_path = os.path.join(versions_folder, item_name)
+        if os.path.isdir(item_full_path):  # 判断是否为目录
+            jar_full_path = os.path.join(item_full_path, f"{item_name}.jar")
+            json_full_path = os.path.join(item_full_path, f"{item_name}.json")
+            if await aiofiles.os.path.exists(jar_full_path) and await aiofiles.os.path.exists(json_full_path):
+                subfolder_names.append(item_name)
+                subfolder_dict[item_name] = item_full_path
+    # 我感觉应该不会有人随便往versions里面扔文件夹吧。。。
+
+    return subfolder_names, subfolder_dict
+
+
+async def get_local_selected_version(local_version_list, local_version_dict) -> str | None:
+    selected_version_str = input(f"请输入想要启动的版本{local_version_list}")
+    if selected_version_str in local_version_list:
+        selected_version_folder = local_version_dict[selected_version_str]
+        selected_version_json_path = os.path.join(selected_version_folder, f"{selected_version_str}.json")
+        async with aiofiles.open(selected_version_json_path, "r") as f:
+            selected_version_json_str = await f.read()
+            selected_version_json = json.loads(selected_version_json_str)
+            return selected_version_json
+    logging.warning(f"输入的版本号无效{selected_version_str}")
+    raise ValueError
+
+
+async def get_launch_arguments(selected_version_json):
+    if "arguments" in selected_version_json:
+        game_argument_list = []
+        jvm_argument_list = []
+        arguments = selected_version_json["arguments"]
+        game_arguments: list = arguments["game"]
+        jvm_arguments: list = arguments["jvm"]
+        game_arguments_str = ""
+        jvm_arguments_str = ""
+        for argument in game_arguments:
+            if type(argument) == dict:
+                rules = argument["rules"]
+                if is_allowed(
+                        rules
+                        # TODO: features
+                ):
+                    value = argument["value"]
+                    if type(value) == str:
+                        game_argument_list.append(value)
+                    elif type(value) == list:
+                        for v in value:
+                            game_argument_list.append(v)
+
+            elif type(argument) == str:
+                jvm_argument_list.append(argument)
+        for argument in jvm_arguments:
+            if type(argument) == dict:
+                rules = argument["rules"]
+                if is_allowed(
+                        rules
+                        # TODO: features
+                ):
+                    value = argument["value"]
+                    if type(value) == str:
+                        jvm_argument_list.append(value)
+                    elif type(value) == list:
+                        for v in value:
+                            jvm_argument_list.append(v)
+
+            elif type(argument) == str:
+                jvm_argument_list.append(argument)
+        for game_argument in game_argument_list:
+            game_arguments_str = game_arguments_str + game_argument + " "
+        for jvm_argument in jvm_argument_list:
+            jvm_arguments_str = jvm_arguments_str + jvm_argument + " "
+        main_class = selected_version_json["mainClass"]
+        argument_str = (jvm_arguments_str + main_class + game_arguments_str).strip()
+        print(argument_str)
+
+
+async def launch_selected_version(dl: Downloader, selected_version_json):
+    await get_launch_arguments(selected_version_json)
+
+async def launch_main(dl: Downloader):
+    local_version_list, local_version_dict = await get_local_version_list()
+    selected_version_json = await get_local_selected_version(local_version_list, local_version_dict)
+    await launch_selected_version(dl, selected_version_json)
 
 
 async def main():
     connector = aiohttp.TCPConnector(limit=512)
     async with aiohttp.ClientSession(connector=connector) as session:
-        await download_main(session)
+        dl = Downloader(session=session)
+        await launch_main(dl)
+        # await download_main(dl)
 
 
 def get_architecture():
-    arch_ = platform.machine().lower()  # 统一转为小写，避免大小写问题
+    arch_ = platform.machine().lower()  # 统一转为小写，避免大小写问题 (虽然我也不知道这些架构能不能跑起来)
     if arch_ in ['x86_64', 'amd64']:
         return 'x64'
     elif arch_ in ['i386', 'i686', 'x86']:
@@ -316,10 +413,12 @@ def rotate_logs(base_log_file: str, max_files: int = 5):
     if os.path.exists(base_log_file):
         shutil.move(base_log_file, f"{base_log_file}.1")
 
+
 class InfoFilter(logging.Filter):
     def filter(self, record):
         # 只允许 INFO 以上
         return record.levelno >= logging.INFO
+
 
 def setup_async_logger(log_file: str):
     rotate_logs(log_file, max_files=5)
@@ -359,6 +458,7 @@ if __name__ == "__main__":
     arch = get_architecture()
     os_version = get_os_version()
     version_manifest_v2_path = os.path.join(pml_folder, "version_manifest_v2.json")
+    versions_folder = os.path.join(minecraft_folder, "versions")
 
     logfile_path = os.path.join(pml_folder, "log.log")
     listener = setup_async_logger(logfile_path)
