@@ -118,7 +118,6 @@ async def get_selected_version(version_list, version_dict_list):
 
 async def download_assets_of_selected_version(dl: Downloader, selected_version_json):
     asset_root_url = "https://resources.download.minecraft.net"
-    assets_folder = os.path.join(minecraft_folder, "assets")
     asset_index_dict = selected_version_json["assetIndex"]
     asset_index_id = asset_index_dict["id"]
     asset_index_sha1 = asset_index_dict["sha1"]
@@ -171,17 +170,17 @@ def is_allowed(rules, features: dict = None):
                 version_pattern = re.compile(os_rule["version"])
                 if not version_pattern.match(os_version):
                     continue
-            if "feature" in os_rule:
-                if features is not None:
-                    target_features: dict = os_rule["feature"]
-                    for target_feature in target_features:
-                        if target_feature in features:
-                            if features[target_feature] != target_features[target_feature]:
-                                continue
-                        else:
+        if "features" in rule:
+            if features is not None:
+                target_features: dict = rule["feature"]
+                for target_feature in target_features:
+                    if target_feature in features:
+                        if features[target_feature] != target_features[target_feature]:
                             continue
-                else:
-                    continue
+                    else:
+                        continue
+            else:
+                continue
         if rule["action"] == "allow":
             action = True
         if rule["action"] == "disallow":
@@ -189,8 +188,7 @@ def is_allowed(rules, features: dict = None):
     return action
 
 
-async def download_library(dl: Downloader, library_dict, selected_version_folder, selected_version_id,
-                           libraries_folder):
+async def download_library(dl: Downloader, library_dict, selected_version_folder, selected_version_id):
     if "rules" in library_dict:
         rules = library_dict["rules"]
         if not is_allowed(rules):
@@ -231,17 +229,17 @@ async def download_library(dl: Downloader, library_dict, selected_version_folder
                         f.write(data)
 
         # 放到线程池执行，避免阻塞事件循环
-        await loop.run_in_executor(None, unzip_sync)  # noinspection PyTypeChecker
-        # 奇妙警告,爱来自PY-63820,不知道为何还无法抑制
+        # noinspection PyTypeChecker
+        await loop.run_in_executor(None, unzip_sync)
+        # 奇妙警告,爱来自PY-63820
 
 
 async def download_selected_version_libraries(dl: Downloader, selected_version_json,
                                               selected_version_folder, selected_version_id):
-    libraries_folder = os.path.join(minecraft_folder, "libraries")
     selected_version_libraries_list = selected_version_json["libraries"]
     tasks = []
     for library in selected_version_libraries_list:
-        tasks.append(download_library(dl, library, selected_version_folder, selected_version_id, libraries_folder))
+        tasks.append(download_library(dl, library, selected_version_folder, selected_version_id))
     await asyncio.gather(*tasks)
 
 
@@ -276,7 +274,7 @@ async def get_local_version_list():  # and dict(
     logging.debug("开始统计版本")
     subfolder_names = []
     subfolder_dict = {}
-    if not aiofiles.os.path.exists(versions_folder):
+    if not await aiofiles.os.path.exists(versions_folder):
         logging.warning(f"versions目录不存在:{versions_folder}")
         raise Exception
     for item_name in await aiofiles.os.listdir(versions_folder):
@@ -292,20 +290,53 @@ async def get_local_version_list():  # and dict(
     return subfolder_names, subfolder_dict
 
 
-async def get_local_selected_version(local_version_list, local_version_dict) -> str | None:
+async def get_local_selected_version(local_version_list, local_version_dict) -> tuple[dict, str, str]:
     selected_version_str = input(f"请输入想要启动的版本{local_version_list}")
     if selected_version_str in local_version_list:
-        selected_version_folder = local_version_dict[selected_version_str]
+        selected_version_folder: str = local_version_dict[selected_version_str]
         selected_version_json_path = os.path.join(selected_version_folder, f"{selected_version_str}.json")
         async with aiofiles.open(selected_version_json_path, "r") as f:
             selected_version_json_str = await f.read()
-            selected_version_json = json.loads(selected_version_json_str)
-            return selected_version_json
+            selected_version_json: dict = json.loads(selected_version_json_str)
+            return selected_version_json, selected_version_folder, selected_version_str
     logging.warning(f"输入的版本号无效{selected_version_str}")
     raise ValueError
 
 
-async def get_launch_arguments(selected_version_json):
+async def replace_variable(argument_str, selected_version_folder, selected_version_id, selected_version_json):
+    natives_directory = os.path.join(selected_version_folder, f"{selected_version_id}-natives")
+
+    library_list = selected_version_json["libraries"]
+    classpath_list = []
+    for i in library_list:
+        classpath_list.append(i["downloads"]["artifact"]["path"])
+    selected_version_jar_path = os.path.join(selected_version_folder, f"{selected_version_id}.jar")
+    classpath_list.append(selected_version_jar_path)
+    classpath = ';'.join(classpath_list)
+
+
+    replacement = {
+        "natives_directory"
+        "launcher_name"
+        "launcher_version"
+        "classpath"
+        "auth_player_name"
+        "auth_session"
+        "game_directory"
+        "game_asset"
+        "version_name"
+        "assets_root"
+        "assets_index_name"
+        "auth_uuid"
+        "auth_access_token"
+        "clientid"
+        "auth_xuid"
+        "version_type"
+    }
+
+
+async def get_launch_arguments(selected_version_json, selected_version_folder, selected_version_id):
+    main_class = selected_version_json["mainClass"] + " "
     if "arguments" in selected_version_json:
         game_argument_list = []
         jvm_argument_list = []
@@ -329,7 +360,7 @@ async def get_launch_arguments(selected_version_json):
                             game_argument_list.append(v)
 
             elif type(argument) == str:
-                jvm_argument_list.append(argument)
+                game_argument_list.append(argument)
         for argument in jvm_arguments:
             if type(argument) == dict:
                 rules = argument["rules"]
@@ -350,27 +381,107 @@ async def get_launch_arguments(selected_version_json):
             game_arguments_str = game_arguments_str + game_argument + " "
         for jvm_argument in jvm_argument_list:
             jvm_arguments_str = jvm_arguments_str + jvm_argument + " "
-        main_class = selected_version_json["mainClass"]
-        argument_str = (jvm_arguments_str + main_class + game_arguments_str).strip()
-        print(argument_str)
+    else:
+        game_arguments_str = selected_version_json["minecraftArguments"]
+        jvm_arguments_str = ""
+        jvm_argument_list = []
+        jvm_arguments = [  # 1.13以下无自带JVM参数   照抄一下1.13.2的吧（
+            {
+                "rules": [
+                    {
+                        "action": "allow",
+                        "os": {
+                            "name": "osx"
+                        }
+                    }
+                ],
+                "value": [
+                    "-XstartOnFirstThread"
+                ]
+            },
+            {
+                "rules": [
+                    {
+                        "action": "allow",
+                        "os": {
+                            "name": "windows"
+                        }
+                    }
+                ],
+                "value": "-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump"
+            },
+            {
+                "rules": [
+                    {
+                        "action": "allow",
+                        "os": {
+                            "name": "windows",
+                            "version": "^10\\."
+                        }
+                    }
+                ],
+                "value": [
+                    '-Dos.name="Windows 10"',  # 我靠这玩意不打引号启动不了
+                    "-Dos.version=10.0"
+                ]
+            },
+            {
+                "rules": [
+                    {
+                        "action": "allow",
+                        "os": {
+                            "arch": "x86"
+                        }
+                    }
+                ],
+                "value": "-Xss1M"
+            },
+            "-Djava.library.path=${natives_directory}",
+            "-Dminecraft.launcher.brand=${launcher_name}",
+            "-Dminecraft.launcher.version=${launcher_version}",
+            "-cp",
+            "${classpath}"
+        ]
+        for argument in jvm_arguments:
+            if type(argument) == dict:
+                rules = argument["rules"]
+                if is_allowed(
+                        rules
+                        # TODO: features
+                ):
+                    value = argument["value"]
+                    if type(value) == str:
+                        jvm_argument_list.append(value)
+                    elif type(value) == list:
+                        for v in value:
+                            jvm_argument_list.append(v)
+
+            elif type(argument) == str:
+                jvm_argument_list.append(argument)
+        for jvm_argument in jvm_argument_list:
+            jvm_arguments_str = jvm_arguments_str + jvm_argument + " "
+
+    argument_str = (jvm_arguments_str + main_class + game_arguments_str).strip()
+    logging.debug(argument_str)
 
 
-async def launch_selected_version(dl: Downloader, selected_version_json):
-    await get_launch_arguments(selected_version_json)
+async def launch_selected_version(session, selected_version_json, selected_version_folder, selected_version_id):
+    await get_launch_arguments(selected_version_json, selected_version_folder, selected_version_id)
 
 
-async def launch_main(dl: Downloader):
+async def launch_main(session):
     local_version_list, local_version_dict = await get_local_version_list()
-    selected_version_json = await get_local_selected_version(local_version_list, local_version_dict)
-    await launch_selected_version(dl, selected_version_json)
+    selected_version_json, selected_version_folder, selected_version_id = \
+        await get_local_selected_version(local_version_list, local_version_dict)
+    await launch_selected_version(session, selected_version_json, selected_version_folder, selected_version_id)
 
 
 async def main():
     connector = aiohttp.TCPConnector(limit=512)
     async with aiohttp.ClientSession(connector=connector) as session:
         dl = Downloader(session=session)
-        # await launch_main(dl)
-        await download_main(dl)
+        await launch_main(session)
+        # await download_main(dl)
 
 
 def get_architecture():
@@ -459,13 +570,19 @@ if __name__ == "__main__":
     pml_folder = os.path.join(cwd, "PML")
     os.makedirs(pml_folder, exist_ok=True)
     minecraft_folder = os.path.join(cwd, ".minecraft")
+    assets_folder = os.path.join(minecraft_folder, "assets")
+    versions_folder = os.path.join(minecraft_folder, "versions")
+    libraries_folder = os.path.join(minecraft_folder, "libraries")
     name = get_os()
     arch = get_architecture()
     os_version = get_os_version()
     version_manifest_v2_path = os.path.join(pml_folder, "version_manifest_v2.json")
-    versions_folder = os.path.join(minecraft_folder, "versions")
 
     logfile_path = os.path.join(pml_folder, "log.log")
     listener = setup_async_logger(logfile_path)
+
+    launcher_name = "PML"
+    launcher_version = "1.0"
+
 
     asyncio.run(main())
