@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 import webbrowser
-from typing import List
+from typing import List, Optional
 
 import keyring
 import msal
@@ -26,15 +26,23 @@ class AccountManager:
     _MC_AUTH_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
     _MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
 
-    def __init__(self):
+    def __init__(self, session: Optional[ClientSession] = None):
         self.logger = logging.getLogger(__name__)
         self.service_name = "PML"
         self.account_list = self.get_account_list()
+        self.session = session
+        self._is_internal_session = session is None
         # 初始化MSAL客户端
         self.msal_app = msal.PublicClientApplication(
             self._MSA_CLIENT_ID,
             authority=self._MSA_AUTHORITY
         )
+
+    async def _ensure_session(self):
+        """确保session已初始化（内部使用，首次调用网络方法时自动创建）"""
+        if self.session is None or self.session.closed:
+            self.session = ClientSession()
+            self._is_internal_session = True
 
     def get_account_list(self) -> List[str]:  # 获取账户列表(元数据)
         metadata_str = keyring.get_password(self.service_name, "metadata")
@@ -130,6 +138,7 @@ class AccountManager:
 
     async def msa_login(self) -> tuple:
         """执行MSA登录流程，返回(username, uuid, refresh_token)"""
+        await self._ensure_session()
         # 1. 获取设备代码（原有逻辑不变）
         device_flow = self.msal_app.initiate_device_flow(scopes=self._MSA_SCOPE)
         if "error" in device_flow:
@@ -176,6 +185,7 @@ class AccountManager:
 
         返回: (新的access_token, 最新用户名, 用户UUID)
         """
+        await self._ensure_session()
         # 1. 获取本地存储的账户信息（含UUID和旧refresh token）
         account_info = self.get_account(username)
         stored_uuid = account_info['user_uuid']  # 本地存储的UUID（作为账户唯一标识）
@@ -243,76 +253,72 @@ class AccountManager:
 
     async def _get_xbl_token(self, access_token: str) -> str:
         """获取Xbox Live令牌"""
-        async with ClientSession() as session:
-            payload = {
-                "Properties": {
-                    "AuthMethod": "RPS",
-                    "SiteName": "user.auth.xboxlive.com",
-                    "RpsTicket": f"d={access_token}"
-                },
-                "RelyingParty": "http://auth.xboxlive.com",
-                "TokenType": "JWT"
-            }
+        payload = {
+            "Properties": {
+                "AuthMethod": "RPS",
+                "SiteName": "user.auth.xboxlive.com",
+                "RpsTicket": f"d={access_token}"
+            },
+            "RelyingParty": "http://auth.xboxlive.com",
+            "TokenType": "JWT"
+        }
 
-            async with session.post(self._XBL_AUTH_URL, json=payload) as resp:
-                if resp.status != 200:
-                    raise Exception(f"XBL认证失败: {await resp.text()}")
+        async with self.session.post(self._XBL_AUTH_URL, json=payload) as resp:
+            if resp.status != 200:
+                raise Exception(f"XBL认证失败: {await resp.text()}")
 
-                data = await resp.json()
-                return data['Token']
+            data = await resp.json()
+            return data['Token']
 
     async def _get_xsts_token(self, xbl_token: str) -> tuple:
         """获取XSTS令牌和用户哈希"""
-        async with ClientSession() as session:
-            payload = {
-                "Properties": {
-                    "SandboxId": "RETAIL",
-                    "UserTokens": [xbl_token]
-                },
-                "RelyingParty": "rp://api.minecraftservices.com/",
-                "TokenType": "JWT"
-            }
+        payload = {
+            "Properties": {
+                "SandboxId": "RETAIL",
+                "UserTokens": [xbl_token]
+            },
+            "RelyingParty": "rp://api.minecraftservices.com/",
+            "TokenType": "JWT"
+        }
 
-            async with session.post(self._XSTS_AUTH_URL, json=payload) as resp:
-                if resp.status != 200:
-                    raise Exception(f"XSTS认证失败: {await resp.text()}")
+        async with self.session.post(self._XSTS_AUTH_URL, json=payload) as resp:
+            if resp.status != 200:
+                raise Exception(f"XSTS认证失败: {await resp.text()}")
 
-                data = await resp.json()
-                return data['Token'], data['DisplayClaims']['xui'][0]['uhs']
+            data = await resp.json()
+            return data['Token'], data['DisplayClaims']['xui'][0]['uhs']
 
     async def _get_minecraft_profile(self, mc_access_token: str) -> dict:
         """调用Minecraft个人资料接口，获取规范的用户名（name）和UUID（id）"""
-        async with ClientSession() as session:
-            # 请求必须携带access_token（Bearer认证）
-            headers = {
-                "Authorization": f"Bearer {mc_access_token}"
+        # 请求必须携带access_token（Bearer认证）
+        headers = {
+            "Authorization": f"Bearer {mc_access_token}"
+        }
+
+        async with self.session.get(self._MC_PROFILE_URL, headers=headers) as resp:
+            if resp.status == 404:
+                raise Exception("该MSA账号未购买Minecraft，无法登录正版游戏")
+            if resp.status != 200:
+                raise Exception(f"获取个人资料失败: {await resp.text()}")
+
+            profile = await resp.json()
+            return {
+                "name": profile["name"],
+                "id": profile["id"]
             }
-
-            async with session.get(self._MC_PROFILE_URL, headers=headers) as resp:
-                if resp.status == 404:
-                    raise Exception("该MSA账号未购买Minecraft，无法登录正版游戏")
-                if resp.status != 200:
-                    raise Exception(f"获取个人资料失败: {await resp.text()}")
-
-                profile = await resp.json()
-                return {
-                    "name": profile["name"],
-                    "id": profile["id"]
-                }
 
     async def _get_minecraft_auth(self, xsts_token: str, user_hash: str) -> dict:
         """获取Minecraft访问令牌（仅返回access_token，用于后续请求个人资料）"""
-        async with ClientSession() as session:
-            payload = {
-                "identityToken": f"XBL3.0 x={user_hash};{xsts_token}"
-            }
+        payload = {
+            "identityToken": f"XBL3.0 x={user_hash};{xsts_token}"
+        }
 
-            async with session.post(self._MC_AUTH_URL, json=payload) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Minecraft认证失败: {await resp.text()}")
+        async with self.session.post(self._MC_AUTH_URL, json=payload) as resp:
+            if resp.status != 200:
+                raise Exception(f"Minecraft认证失败: {await resp.text()}")
 
-                data = await resp.json()
-                return {"access_token": data["access_token"]}
+            data = await resp.json()
+            return {"access_token": data["access_token"]}
 
     async def add_msa_account(self):
         try:
@@ -322,9 +328,23 @@ class AccountManager:
         except Exception as e:
             print(f"登录失败: {str(e)}")
 
+    async def close_session(self):
+        if self._is_internal_session and self.session and not self.session.closed:
+            await self.session.close()
+            self.logger.info("内部创建的ClientSession已关闭")
+        elif not self._is_internal_session and self.session:
+            self.logger.warning("当前session为外部传入，需由调用者自行关闭")
+
 
 if __name__ == "__main__":
-    account_manager = AccountManager()
-    # asyncio.run(account_manager.add_msa_account())
-    print(account_manager.get_account_list())
-    asyncio.run(account_manager.refresh_account_token(input("请输入用户名")))
+    async def main():
+        account_manager = AccountManager()
+        try:
+            print("当前账户列表:", account_manager.get_account_list())
+            username = input("请输入要刷新的用户名: ")
+            await account_manager.refresh_account_token(username)
+        finally:
+            # 确保无论操作成功/失败，都关闭session
+            await account_manager.close_session()
+
+    asyncio.run(main())
